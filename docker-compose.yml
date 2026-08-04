@@ -36,11 +36,10 @@ services:
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
 
-      # ===== FlareSolverr 验证码求解(可选)=====
-      # 启用后,遇到 Turnstile 挑战时优先调用 FlareSolverr 求解,
-      # 失败再回退到浏览器内方案。配了下面的 flaresolverr 服务就填:
-      #   FLARESOLVERR_URL: "http://flaresolverr:8191"
-      FLARESOLVERR_URL: ""
+      # ===== FlareSolverr 验证码求解 =====
+      # 已默认启用,配合下方 flaresolverr 服务一起启动。
+      # 遇到 Turnstile 挑战时优先调用 FlareSolverr 求解,失败再回退到浏览器内方案。
+      FLARESOLVERR_URL: "http://flaresolverr:8191"
 
       # ===== 浏览器持久化 =====
       # storage_state(cookies/localStorage)保存目录,挂载到 Docker volume,
@@ -64,26 +63,20 @@ services:
       retries: 3
       start_period: 60s
 
-  # ===== 可选:FlareSolverr 验证码求解服务 =====
-  # 启用方法:
-  #   1. 取消下面 flaresolverr 服务的注释
-  #   2. 把 perchance 服务的 FLARESOLVERR_URL 改为 "http://flaresolverr:8191"
-  #   3. 取消 perchance 的 depends_on 注释(可选)
-  #
-  # 内存占用:约 200-300MB
-  # 成功率:60-80%(视 IP 质量),数据中心 IP 建议配合住宅代理
-  #
-  # flaresolverr:
-  #   image: flaresolverr/flaresolverr:latest
-  #   container_name: flaresolverr
-  #   restart: unless-stopped
-  #   environment:
-  #     LOG_LEVEL: info
-  #     BROWSER_TIMEOUT: 60000
-  #   # 不需要对外暴露端口,内网通信即可
-  #   # ports:
-  #   #   - "8191:8191"
-  #   shm_size: "1g"
+  # ===== FlareSolverr 验证码求解服务 =====
+  # 默认启用,与 perchance 服务的 FLARESOLVERR_URL 对应。
+  # 内存占用约 200-300MB,不需要时可注释掉整段并把 FLARESOLVERR_URL 清空。
+  flaresolverr:
+    image: flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      BROWSER_TIMEOUT: 60000
+    # 不需要对外暴露端口,内网通信即可
+    # ports:
+    #   - "8191:8191"
+    shm_size: "1g"
 
 # 持久化卷:浏览器 storage_state 存在这里,容器重建不丢失
 volumes:
