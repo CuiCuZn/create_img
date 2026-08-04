@@ -99,7 +99,7 @@ class FlareSolverrClient:
             status = data.get("status")
             if status != "ok":
                 msg = data.get("message", "")
-                logger.warning("FlareSolverr 求解失败(status=%s): %s", status, msg[:200])
+                logger.warning("FlareSolverr Turnstile 求解失败(status=%s): %s", status, msg[:200])
                 return None
 
             solution = data.get("solution", {})
@@ -109,14 +109,86 @@ class FlareSolverrClient:
                 return None
 
             elapsed = time.time() - t0
-            logger.info("FlareSolverr 求解成功(token len=%d, 耗时=%.1fs)", len(token), elapsed)
+            logger.info("FlareSolverr Turnstile 求解成功(token len=%d, 耗时=%.1fs)", len(token), elapsed)
             return token
 
         except httpx.TimeoutException:
-            logger.warning("FlareSolverr 求解超时(>%ds)", self.timeout)
+            logger.warning("FlareSolverr Turnstile 求解超时(>%ds)", self.timeout)
             return None
         except Exception as e:
-            logger.warning("FlareSolverr 求解异常: %s", e)
+            logger.warning("FlareSolverr Turnstile 求解异常: %s", e)
+            return None
+
+    async def request_get(self, url: str) -> Optional[dict]:
+        """用 FlareSolverr 访问一个 URL,过 Cloudflare 后返回响应数据。
+
+        用于处理"第 1 层"Cloudflare 挑战页(Just a moment):
+        FlareSolverr 内部浏览器加载页面 → 过 CF 挑战 → 返回 cookies + 页面内容。
+        我们拿到 cf_clearance cookie 后注入到 patchright 浏览器,即可继续访问。
+
+        返回 dict 结构(FlareSolverr solution):
+            {
+                "url": "...",
+                "status": 200,
+                "cookies": [{"name": "cf_clearance", "value": "...", ...}, ...],
+                "response": "<html>...</html>",
+                "userAgent": "...",
+                ...
+            }
+
+        失败返回 None。
+        """
+        if not self.enabled:
+            return None
+
+        t0 = time.time()
+        try:
+            sess = await self._get_session()
+            payload = {
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": self.timeout * 1000,
+            }
+            logger.info("调用 FlareSolverr request.get 过 CF 挑战: %s", url[:100])
+            resp = await sess.post("/v1", json=payload)
+
+            if resp.status_code != 200:
+                logger.warning("FlareSolverr request.get HTTP %d: %s", resp.status_code, resp.text[:200])
+                return None
+
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning("FlareSolverr request.get 响应非 JSON: %s", resp.text[:200])
+                return None
+
+            status = data.get("status")
+            if status != "ok":
+                msg = data.get("message", "")
+                logger.warning("FlareSolverr request.get 失败(status=%s): %s", status, msg[:200])
+                return None
+
+            solution = data.get("solution", {})
+            cookies = solution.get("cookies", [])
+            elapsed = time.time() - t0
+
+            # 统计 cf_clearance 是否拿到
+            cf_cookies = [c for c in cookies if c.get("name") == "cf_clearance"]
+            if cf_cookies:
+                logger.info("FlareSolverr 过 CF 成功!拿到 cf_clearance(耗时=%.1fs, cookies=%d)",
+                            elapsed, len(cookies))
+            else:
+                logger.warning("FlareSolverr 响应成功但没找到 cf_clearance cookie"
+                               "(可能页面本身没 CF 挑战,或挑战未通过)。cookies=%d, 耗时=%.1fs",
+                               len(cookies), elapsed)
+
+            return solution
+
+        except httpx.TimeoutException:
+            logger.warning("FlareSolverr request.get 超时(>%ds)", self.timeout)
+            return None
+        except Exception as e:
+            logger.warning("FlareSolverr request.get 异常: %s", e)
             return None
 
     async def close(self) -> None:

@@ -130,6 +130,77 @@ class PerchanceClient:
 
     # ---------- 1. verifyUser ----------
 
+    async def _try_flaresolverr_bypass_challenge(self, page: Page) -> bool:
+        """尝试用 FlareSolverr 绕过 Cloudflare 挑战页(第 1 层)。
+
+        流程:
+          1. FlareSolverr 内部浏览器加载当前 URL → 过 CF 挑战
+          2. 拿到 cf_clearance 等 cookies
+          3. 注入到当前 page 的 browser context
+          4. 返回 True 表示成功(调用方应重试请求)
+
+        失败返回 False(调用方继续原错误处理)。
+        """
+        from app.core.cf_solver import flaresolverr  # 延迟导入
+        if not flaresolverr.enabled:
+            return False
+
+        current_url = page.url
+        # 用一个干净的 verifyUser URL 让 FlareSolverr 访问
+        target_url = self._verify_url()
+        solution = await flaresolverr.request_get(target_url)
+        if not solution:
+            logger.warning("FlareSolverr 过 CF 挑战失败,无法获取 cf_clearance")
+            return False
+
+        cookies = solution.get("cookies", [])
+        if not cookies:
+            logger.warning("FlareSolverr 返回了响应但没有 cookies")
+            return False
+
+        # 过滤出 image-generation.perchance.org 域的 cookie,
+        # 并从 cookie 里提取 domain / path 等信息注入到 context
+        cf_cookies = [c for c in cookies if c.get("name") == "cf_clearance"]
+        if not cf_cookies:
+            logger.warning("FlareSolverr cookies 中没有 cf_clearance,可能挑战未真正通过")
+            # 即使没 cf_clearance,也把所有 cookie 注入试试,没准有用
+            pass
+
+        # 把 cookies 注入到当前 context
+        # FlareSolverr 返回的 cookie 格式: {name, value, domain, path, ...}
+        # patchright add_cookies 需要的格式: {name, value, domain, path, ...}
+        # 大部分字段兼容,只需确保 domain 正确(以 . 开头的要处理一下)
+        try:
+            ctx_cookies = []
+            for c in cookies:
+                cookie = {
+                    "name": c.get("name", ""),
+                    "value": c.get("value", ""),
+                    "domain": c.get("domain", ".perchance.org"),
+                    "path": c.get("path", "/"),
+                }
+                # 处理 expires:FlareSolverr 可能返回时间戳,patchright 要的也是时间戳
+                if "expiry" in c and c["expiry"]:
+                    cookie["expires"] = float(c["expiry"])
+                elif "expires" in c and c["expires"]:
+                    cookie["expires"] = float(c["expires"])
+                if "secure" in c:
+                    cookie["secure"] = bool(c["secure"])
+                if "httpOnly" in c:
+                    cookie["httpOnly"] = bool(c["httpOnly"])
+                if cookie["name"]:
+                    ctx_cookies.append(cookie)
+
+            if ctx_cookies:
+                await self._context.add_cookies(ctx_cookies)
+                logger.info("已向浏览器注入 %d 个 cookie(含 cf_clearance=%d)",
+                            len(ctx_cookies), len(cf_cookies))
+                return True
+            return False
+        except Exception as e:
+            logger.warning("注入 FlareSolverr cookies 失败: %s", e)
+            return False
+
     async def _ensure_user_key(self, page: Page) -> str:
         """获取有效的 userKey,带缓存。失效时调用方应清空缓存后重试。"""
         if self._user_key:
@@ -145,7 +216,7 @@ class PerchanceClient:
         旧逻辑遇到 token_required 直接抛异常放弃;现改为主动尝试解 Turnstile。
         """
         token = ""  # 首次无 token 走无感验证路径
-        for attempt in range(2):  # 最多两轮:无 token / 带 token
+        for attempt in range(3):  # 最多 3 轮:无 token / FlareSolverr 绕过后重试 / 带 token
             url = self._verify_url(token=token)
             logger.info("verifyUser 请求(attempt=%d, token=%s): %s",
                         attempt, "有" if token else "无", url[:120])
@@ -162,6 +233,11 @@ class PerchanceClient:
             low = content.lower()
             if "just a moment" in low or "challenge-platform" in low:
                 logger.warning("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
+                # 尝试用 FlareSolverr 过第 1 层 CF 挑战,拿到 cf_clearance 后重试
+                solved = await self._try_flaresolverr_bypass_challenge(page)
+                if solved:
+                    logger.info("FlareSolverr 过 CF 挑战成功,重新请求 verifyUser")
+                    continue  # 重新走无 token 的 verifyUser
                 raise RateLimitError("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
 
             # 已有 userKey,直接返回(IP 可信路径)
@@ -194,7 +270,7 @@ class PerchanceClient:
                 f"verifyUser 未返回 userKey。响应片段: {snippet[:300]!r}"
             )
 
-        raise AuthenticationError("verifyUser 两轮后仍未拿到 userKey")
+        raise AuthenticationError("verifyUser 三轮后仍未拿到 userKey")
 
     async def _solve_turnstile_token(self, page: Page) -> str:
         """求解 Cloudflare Turnstile,返回 token。
