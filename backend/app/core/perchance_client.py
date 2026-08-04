@@ -133,43 +133,84 @@ class PerchanceClient:
     async def _try_flaresolverr_bypass_challenge(self, page: Page) -> bool:
         """尝试用 FlareSolverr 绕过 Cloudflare 挑战页(第 1 层)。
 
-        流程:
-          1. FlareSolverr 内部浏览器加载当前 URL → 过 CF 挑战
-          2. 拿到 cf_clearance 等 cookies
-          3. 注入到当前 page 的 browser context
-          4. 返回 True 表示成功(调用方应重试请求)
+        策略:
+          1. FlareSolverr 的浏览器直接访问 verifyUser URL(它的指纹好,通常直接能过)
+          2. 如果响应里直接有 userKey → 直接提取并缓存(最理想情况)
+          3. 如果拿到了 cf_clearance cookie → 注入到 patchright 浏览器并重试
+          4. 如果页面里有 Turnstile → 用 turnstile.solve 求解
+          5. 以上都不行 → 返回 False
 
-        失败返回 False(调用方继续原错误处理)。
+        返回 True 表示"可以重试 verifyUser 了"(要么有 cookie 了要么 userKey 直接拿到了)。
         """
         from app.core.cf_solver import flaresolverr  # 延迟导入
         if not flaresolverr.enabled:
             return False
 
-        current_url = page.url
-        # 用一个干净的 verifyUser URL 让 FlareSolverr 访问
         target_url = self._verify_url()
         solution = await flaresolverr.request_get(target_url)
         if not solution:
-            logger.warning("FlareSolverr 过 CF 挑战失败,无法获取 cf_clearance")
+            logger.warning("FlareSolverr request.get 失败")
             return False
 
+        response_html = solution.get("response", "") or ""
         cookies = solution.get("cookies", [])
-        if not cookies:
-            logger.warning("FlareSolverr 返回了响应但没有 cookies")
+
+        # ===== 策略 1:响应里直接有 userKey → 提取并缓存,直接成功 =====
+        m = _USER_KEY_RE.search(response_html)
+        if m:
+            user_key = m.group(1)
+            logger.info("FlareSolverr 直接拿到了 userKey(它的浏览器直接过了 CF)!缓存备用")
+            self._user_key = user_key
+            # 同时把 cookies 也注入,方便后续 generate 请求使用
+            if cookies:
+                await self._inject_cookies(cookies)
+            return True
+
+        # ===== 策略 2:有 cf_clearance cookie → 注入后重试 =====
+        cf_cookies = [c for c in cookies if c.get("name") == "cf_clearance"]
+        if cf_cookies:
+            await self._inject_cookies(cookies)
+            logger.info("已注入 cf_clearance,重试 verifyUser")
+            return True
+
+        # ===== 策略 3:页面需要 Turnstile(token_required)→ 用 FlareSolverr 求解 =====
+        needs_token = ("token_required" in response_html
+                       or "failed_verification" in response_html
+                       or "verification_required" in response_html)
+        if needs_token:
+            logger.info("FlareSolverr 页面显示需要 Turnstile,调用 turnstile.solve...")
+            sitekey = config.TURNSTILE_SITEKEY
+            token = await flaresolverr.solve_turnstile(sitekey, config.EMBED_URL)
+            if token and len(token) >= config.TURNSTILE_TOKEN_MIN_LEN:
+                # 有 token 了,带 token 重新请求 verifyUser
+                # 这里直接在 verifyUser 的循环里继续,我们返回 True 并让 token 通过某种方式传回去
+                # 简化:把 token 存在一个临时属性里,_verify_user 循环里读取
+                self._pending_turnstile_token = token
+                # 同时注入 cookie
+                if cookies:
+                    await self._inject_cookies(cookies)
+                logger.info("FlareSolverr 求解 Turnstile 成功(token len=%d),准备带 token 重请求", len(token))
+                return True
+            else:
+                logger.warning("FlareSolverr Turnstile 求解失败")
+                return False
+
+        # ===== 策略 4:页面是 CF 挑战页但 FlareSolverr 没解成功(少见)=====
+        low = response_html.lower()
+        if "just a moment" in low or "challenge-platform" in low:
+            logger.warning("FlareSolverr 返回的页面仍是 CF 挑战页,挑战未通过")
             return False
 
-        # 过滤出 image-generation.perchance.org 域的 cookie,
-        # 并从 cookie 里提取 domain / path 等信息注入到 context
-        cf_cookies = [c for c in cookies if c.get("name") == "cf_clearance"]
-        if not cf_cookies:
-            logger.warning("FlareSolverr cookies 中没有 cf_clearance,可能挑战未真正通过")
-            # 即使没 cf_clearance,也把所有 cookie 注入试试,没准有用
-            pass
+        # 其他未知情况:把 cookie 注入了试试
+        if cookies:
+            await self._inject_cookies(cookies)
+            return True
 
-        # 把 cookies 注入到当前 context
-        # FlareSolverr 返回的 cookie 格式: {name, value, domain, path, ...}
-        # patchright add_cookies 需要的格式: {name, value, domain, path, ...}
-        # 大部分字段兼容,只需确保 domain 正确(以 . 开头的要处理一下)
+        logger.warning("FlareSolverr 返回了响应但既无 userKey 也无 cookie,无法判断")
+        return False
+
+    async def _inject_cookies(self, cookies: list) -> None:
+        """把 FlareSolverr 返回的 cookies 注入到当前 browser context。"""
         try:
             ctx_cookies = []
             for c in cookies:
@@ -179,7 +220,6 @@ class PerchanceClient:
                     "domain": c.get("domain", ".perchance.org"),
                     "path": c.get("path", "/"),
                 }
-                # 处理 expires:FlareSolverr 可能返回时间戳,patchright 要的也是时间戳
                 if "expiry" in c and c["expiry"]:
                     cookie["expires"] = float(c["expiry"])
                 elif "expires" in c and c["expires"]:
@@ -193,13 +233,10 @@ class PerchanceClient:
 
             if ctx_cookies:
                 await self._context.add_cookies(ctx_cookies)
-                logger.info("已向浏览器注入 %d 个 cookie(含 cf_clearance=%d)",
-                            len(ctx_cookies), len(cf_cookies))
-                return True
-            return False
+                cf_count = sum(1 for c in ctx_cookies if c["name"] == "cf_clearance")
+                logger.debug("已注入 %d 个 cookie(cf_clearance=%d)", len(ctx_cookies), cf_count)
         except Exception as e:
-            logger.warning("注入 FlareSolverr cookies 失败: %s", e)
-            return False
+            logger.warning("注入 cookies 失败: %s", e)
 
     async def _ensure_user_key(self, page: Page) -> str:
         """获取有效的 userKey,带缓存。失效时调用方应清空缓存后重试。"""
@@ -217,6 +254,12 @@ class PerchanceClient:
         """
         token = ""  # 首次无 token 走无感验证路径
         for attempt in range(3):  # 最多 3 轮:无 token / FlareSolverr 绕过后重试 / 带 token
+            # 如果 FlareSolverr 预取到了 token,本轮直接带 token 请求
+            if getattr(self, "_pending_turnstile_token", ""):
+                token = self._pending_turnstile_token
+                self._pending_turnstile_token = ""
+                logger.info("使用 FlareSolverr 预取的 Turnstile token(len=%d)", len(token))
+
             url = self._verify_url(token=token)
             logger.info("verifyUser 请求(attempt=%d, token=%s): %s",
                         attempt, "有" if token else "无", url[:120])
@@ -233,11 +276,15 @@ class PerchanceClient:
             low = content.lower()
             if "just a moment" in low or "challenge-platform" in low:
                 logger.warning("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
-                # 尝试用 FlareSolverr 过第 1 层 CF 挑战,拿到 cf_clearance 后重试
+                # 尝试用 FlareSolverr 过第 1 层 CF 挑战,拿到 cf_clearance / userKey 后重试
                 solved = await self._try_flaresolverr_bypass_challenge(page)
                 if solved:
-                    logger.info("FlareSolverr 过 CF 挑战成功,重新请求 verifyUser")
-                    continue  # 重新走无 token 的 verifyUser
+                    # 如果 FlareSolverr 直接拿到了 userKey,直接返回
+                    if self._user_key:
+                        logger.info("FlareSolverr 直接获取 userKey 成功,跳过本地验证")
+                        return self._user_key
+                    logger.info("FlareSolverr 处理完成,重新请求 verifyUser")
+                    continue  # 重新走下一轮
                 raise RateLimitError("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
 
             # 已有 userKey,直接返回(IP 可信路径)

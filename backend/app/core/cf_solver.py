@@ -119,7 +119,7 @@ class FlareSolverrClient:
             logger.warning("FlareSolverr Turnstile 求解异常: %s", e)
             return None
 
-    async def request_get(self, url: str) -> Optional[dict]:
+    async def request_get(self, url: str, return_solution: bool = False) -> Optional[dict]:
         """用 FlareSolverr 访问一个 URL,过 Cloudflare 后返回响应数据。
 
         用于处理"第 1 层"Cloudflare 挑战页(Just a moment):
@@ -149,7 +149,7 @@ class FlareSolverrClient:
                 "url": url,
                 "maxTimeout": self.timeout * 1000,
             }
-            logger.info("调用 FlareSolverr request.get 过 CF 挑战: %s", url[:100])
+            logger.info("调用 FlareSolverr request.get(url=%s)", url[:100])
             resp = await sess.post("/v1", json=payload)
 
             if resp.status_code != 200:
@@ -172,15 +172,16 @@ class FlareSolverrClient:
             cookies = solution.get("cookies", [])
             elapsed = time.time() - t0
 
+            http_status = solution.get("status", 0)
             # 统计 cf_clearance 是否拿到
             cf_cookies = [c for c in cookies if c.get("name") == "cf_clearance"]
             if cf_cookies:
-                logger.info("FlareSolverr 过 CF 成功!拿到 cf_clearance(耗时=%.1fs, cookies=%d)",
-                            elapsed, len(cookies))
+                logger.info("FlareSolverr 过 CF 成功!拿到 cf_clearance(耗时=%.1fs, cookies=%d, http=%d)",
+                            elapsed, len(cookies), http_status)
             else:
-                logger.warning("FlareSolverr 响应成功但没找到 cf_clearance cookie"
-                               "(可能页面本身没 CF 挑战,或挑战未通过)。cookies=%d, 耗时=%.1fs",
-                               len(cookies), elapsed)
+                logger.info("FlareSolverr 请求完成(耗时=%.1fs, cookies=%d, http=%d)"
+                            " — 未检测到 CF 挑战(IP 可信或 FlareSolverr 直接通过)",
+                            elapsed, len(cookies), http_status)
 
             return solution
 
