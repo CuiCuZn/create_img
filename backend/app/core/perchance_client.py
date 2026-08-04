@@ -250,15 +250,20 @@ class PerchanceClient:
         否则 perchance 返回 token_required,需先解 Cloudflare Turnstile
         拿到 token,再带 token 重新请求 verifyUser。
 
-        旧逻辑遇到 token_required 直接抛异常放弃;现改为主动尝试解 Turnstile。
+        策略链:
+          1. 先用 patchright 浏览器直接请求(最快,如果有 cf_clearance 就直接过)
+          2. 遇到 CF 挑战页 → 尝试 FlareSolverr 完整验证流程(绕过 patchright 指纹差的问题)
+          3. 遇到 token_required → 先试 FlareSolverr 求解 Turnstile,失败回退浏览器内轮询
         """
+        from app.core.cf_solver import flaresolverr
+
         token = ""  # 首次无 token 走无感验证路径
-        for attempt in range(3):  # 最多 3 轮:无 token / FlareSolverr 绕过后重试 / 带 token
-            # 如果 FlareSolverr 预取到了 token,本轮直接带 token 请求
+        for attempt in range(3):
+            # 如果有预取的 token,本轮带上
             if getattr(self, "_pending_turnstile_token", ""):
                 token = self._pending_turnstile_token
                 self._pending_turnstile_token = ""
-                logger.info("使用 FlareSolverr 预取的 Turnstile token(len=%d)", len(token))
+                logger.info("使用预取的 Turnstile token(len=%d)", len(token))
 
             url = self._verify_url(token=token)
             logger.info("verifyUser 请求(attempt=%d, token=%s): %s",
@@ -276,15 +281,17 @@ class PerchanceClient:
             low = content.lower()
             if "just a moment" in low or "challenge-platform" in low:
                 logger.warning("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
-                # 尝试用 FlareSolverr 过第 1 层 CF 挑战,拿到 cf_clearance / userKey 后重试
-                solved = await self._try_flaresolverr_bypass_challenge(page)
-                if solved:
-                    # 如果 FlareSolverr 直接拿到了 userKey,直接返回
-                    if self._user_key:
-                        logger.info("FlareSolverr 直接获取 userKey 成功,跳过本地验证")
-                        return self._user_key
-                    logger.info("FlareSolverr 处理完成,重新请求 verifyUser")
-                    continue  # 重新走下一轮
+
+                # 用 FlareSolverr 走完整的 verifyUser 流程(绕过 patchright 指纹问题)
+                if flaresolverr.enabled:
+                    logger.info("尝试通过 FlareSolverr 完成完整验证流程...")
+                    fs_user_key = await self._verify_user_via_flaresolverr()
+                    if fs_user_key:
+                        self._user_key = fs_user_key
+                        logger.info("FlareSolverr 验证成功,userKey 已缓存")
+                        return fs_user_key
+                    logger.warning("FlareSolverr 验证流程失败,回退")
+
                 raise RateLimitError("verifyUser 命中 Cloudflare 挑战页,cf_clearance 可能已失效")
 
             # 已有 userKey,直接返回(IP 可信路径)
@@ -310,7 +317,7 @@ class PerchanceClient:
                         f"未能获取 Turnstile token(自动求解失败)。响应片段: {snippet[:200]!r}"
                     )
                 logger.info("已获取 Turnstile token(len=%d),带 token 重新请求 verifyUser", len(token))
-                continue  # 带 token 进入下一轮
+                continue
 
             # 既没 userKey 也没要求 token,或带 token 仍未拿到 userKey
             raise AuthenticationError(
@@ -318,6 +325,81 @@ class PerchanceClient:
             )
 
         raise AuthenticationError("verifyUser 三轮后仍未拿到 userKey")
+
+    async def _verify_user_via_flaresolverr(self) -> Optional[str]:
+        """完全通过 FlareSolverr 执行 verifyUser 流程。
+
+        用于 patchright 被 Cloudflare 第 1 层挑战拦住时的兜底方案。
+        FlareSolverr 的浏览器指纹更好,通常能直接进到 perchance 页面。
+
+        流程:
+          1. FlareSolverr 访问 verifyUser(无 token)
+          2. 如果直接返回 userKey → 成功
+          3. 如果返回 token_required → 调用 solve_turnstile 拿 token
+          4. 带 token 重新请求 verifyUser
+          5. 返回 userKey 或 None
+        """
+        from app.core.cf_solver import flaresolverr
+        if not flaresolverr.enabled:
+            return None
+
+        # 步骤 1:FlareSolverr 访问 verifyUser(无 token)
+        url = self._verify_url()
+        solution = await flaresolverr.request_get(url)
+        if not solution:
+            logger.warning("FlareSolverr verifyUser 第 1 步失败")
+            return None
+
+        response_html = solution.get("response", "") or ""
+
+        # 直接有 userKey 了(IP 非常可信)
+        m = _USER_KEY_RE.search(response_html)
+        if m:
+            logger.info("FlareSolverr 直接拿到 userKey(无需 Turnstile)")
+            # 顺便把 cookies 注入到 patchright 浏览器
+            cookies = solution.get("cookies", [])
+            if cookies:
+                await self._inject_cookies(cookies)
+            return m.group(1)
+
+        # 需要 Turnstile
+        needs_token = ("token_required" in response_html
+                       or "failed_verification" in response_html
+                       or "verification_required" in response_html)
+        if not needs_token:
+            logger.warning("FlareSolverr verifyUser 响应既无 userKey 也不需要 token,未知状态")
+            return None
+
+        logger.info("FlareSolverr 页面需要 Turnstile,开始求解...")
+
+        # 步骤 2:求 Turnstile token
+        token = await flaresolverr.solve_turnstile(config.TURNSTILE_SITEKEY, config.EMBED_URL)
+        if not token or len(token) < config.TURNSTILE_TOKEN_MIN_LEN:
+            logger.warning("FlareSolverr Turnstile 求解失败")
+            return None
+
+        # 步骤 3:带 token 请求 verifyUser
+        token_url = self._verify_url(token=token)
+        solution2 = await flaresolverr.request_get(token_url)
+        if not solution2:
+            logger.warning("FlareSolverr 带 token 请求 verifyUser 失败")
+            return None
+
+        response_html2 = solution2.get("response", "") or ""
+        m2 = _USER_KEY_RE.search(response_html2)
+        if m2:
+            user_key = m2.group(1)
+            logger.info("FlareSolverr 带 token 验证成功,拿到 userKey")
+            # 注入 cookies 到 patchright 浏览器(后续 generate 请求要用)
+            cookies2 = solution2.get("cookies", [])
+            if cookies2:
+                await self._inject_cookies(cookies2)
+            return user_key
+
+        # 带 token 还是失败
+        snippet2 = _strip_html(response_html2)
+        logger.warning("FlareSolverr 带 token 仍未拿到 userKey: %s", snippet2[:200])
+        return None
 
     async def _solve_turnstile_token(self, page: Page) -> str:
         """求解 Cloudflare Turnstile,返回 token。

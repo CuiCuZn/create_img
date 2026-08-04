@@ -63,9 +63,16 @@ class FlareSolverrClient:
     async def solve_turnstile(self, sitekey: str, page_url: str) -> Optional[str]:
         """求解 Cloudflare Turnstile,返回 token 字符串,失败返回 None。
 
+        FlareSolverr v3.x 没有独立的 turnstile.solve 命令。
+        实现思路:
+          1. 创建一个 FlareSolverr session(持久化浏览器上下文)
+          2. 访问 embed 页,注入"等待 Turnstile token 出现"的脚本
+          3. 脚本在页面内轮询 cf-turnstile-response / turnstile.getResponse()
+          4. 拿到 token 后写到 document.title,从返回的 title 中提取
+
         Args:
-            sitekey: Turnstile sitekey(perchance 固定值见 config.TURNSTILE_SITEKEY)
-            page_url: 触发 Turnstile 的页面 URL
+            sitekey: Turnstile sitekey(页面上会自动使用,这里不需要传)
+            page_url: 触发 Turnstile 的页面 URL(通常是 embed 页)
 
         Returns:
             Turnstile token 字符串,失败返回 None
@@ -75,42 +82,115 @@ class FlareSolverrClient:
             return None
 
         t0 = time.time()
+        session_id = f"turnstile_{int(time.time() * 1000)}"
+        sess = await self._get_session()
+
+        # 注入脚本:页面加载后开始轮询 Turnstile token,拿到后写到 document.title
+        # FlareSolverr 的 script 参数会在页面所有脚本之前注入(document_start)。
+        # 我们用 setTimeout 延迟启动轮询,等 Turnstile widget 加载后再读。
+        wait_script = r"""
+() => {
+  window.addEventListener('load', () => {
+    let tries = 0;
+    const maxTries = 40;
+    const interval = 1000;
+    function check() {
+      tries++;
+      let token = '';
+      try {
+        const el = document.querySelector('input[name="cf-turnstile-response"]');
+        if (el && el.value) token = el.value.trim();
+        if (!token && window.turnstile && typeof window.turnstile.getResponse === 'function') {
+          token = (window.turnstile.getResponse() || '').trim();
+        }
+      } catch(e) {}
+      if (token && token.length > 50) {
+        document.title = 'TS_TOKEN_' + token;
+        return;
+      }
+      if (tries === 3) {
+        try {
+          if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset();
+          const w = document.querySelector('.cf-turnstile') || document.querySelector('[data-sitekey]');
+          if (w && w.click) w.click();
+        } catch(e) {}
+      }
+      if (tries >= maxTries) {
+        document.title = 'TS_TOKEN_TIMEOUT_' + tries;
+        return;
+      }
+      setTimeout(check, interval);
+    }
+    setTimeout(check, 2000);
+  });
+}
+""".strip()
+
         try:
-            sess = await self._get_session()
-            payload = {
-                "cmd": "turnstile.solve",
-                "siteKey": sitekey,
+            # 步骤 1:创建 session
+            logger.debug("创建 FlareSolverr session: %s", session_id)
+            resp = await sess.post("/v1", json={
+                "cmd": "sessions.create",
+                "session": session_id,
+            })
+            if resp.status_code != 200:
+                logger.warning("FlareSolverr 创建 session 失败: HTTP %d", resp.status_code)
+                return None
+
+            # 步骤 2:访问 embed 页 + 注入等待脚本
+            # maxTimeout 设长一点(60s),给 Turnstile 验证留时间
+            logger.info("FlareSolverr 访问 embed 页等待 Turnstile: %s", page_url[:80])
+            resp = await sess.post("/v1", json={
+                "cmd": "request.get",
                 "url": page_url,
-            }
-            logger.info("调用 FlareSolverr 求解 Turnstile(sitekey=%s, url=%s)",
-                        sitekey[:16], page_url[:80])
-            resp = await sess.post("/v1", json=payload)
+                "session": session_id,
+                "maxTimeout": max(self.timeout * 1000, 60000),
+                "script": wait_script,
+            })
 
             if resp.status_code != 200:
-                logger.warning("FlareSolverr HTTP %d: %s", resp.status_code, resp.text[:200])
+                logger.warning("FlareSolverr Turnstile 页请求 HTTP %d", resp.status_code)
                 return None
 
-            try:
-                data = resp.json()
-            except Exception:
-                logger.warning("FlareSolverr 响应非 JSON: %s", resp.text[:200])
-                return None
-
-            status = data.get("status")
-            if status != "ok":
+            data = resp.json()
+            if data.get("status") != "ok":
                 msg = data.get("message", "")
-                logger.warning("FlareSolverr Turnstile 求解失败(status=%s): %s", status, msg[:200])
+                logger.warning("FlareSolverr Turnstile 页请求失败: %s", msg[:200])
                 return None
 
             solution = data.get("solution", {})
-            token = str(solution.get("token", "")).strip()
-            if not token or len(token) < config.TURNSTILE_TOKEN_MIN_LEN:
-                logger.warning("FlareSolverr 返回 token 无效(len=%d)", len(token))
-                return None
 
-            elapsed = time.time() - t0
-            logger.info("FlareSolverr Turnstile 求解成功(token len=%d, 耗时=%.1fs)", len(token), elapsed)
-            return token
+            # 步骤 3:从 title 中提取 token
+            title = solution.get("title", "") or ""
+            import re
+            token = ""
+            m = re.match(r"^TS_TOKEN_(.+)$", title)
+            if m:
+                token = m.group(1).strip()
+                if len(token) >= config.TURNSTILE_TOKEN_MIN_LEN:
+                    elapsed = time.time() - t0
+                    logger.info("FlareSolverr Turnstile 求解成功(token len=%d, 耗时=%.1fs)",
+                                len(token), elapsed)
+                    return token
+
+            # 兜底:从 HTML 里找找
+            response_html = solution.get("response", "") or ""
+            m2 = re.search(
+                r'name="cf-turnstile-response"\s+value="([^"]+)"',
+                response_html,
+            )
+            if m2 and len(m2.group(1)) >= config.TURNSTILE_TOKEN_MIN_LEN:
+                token = m2.group(1)
+                elapsed = time.time() - t0
+                logger.info("从 HTML 提取到 Turnstile token(len=%d, 耗时=%.1fs)",
+                            len(token), elapsed)
+                return token
+
+            if title.startswith("TS_TOKEN_TIMEOUT_"):
+                logger.warning("FlareSolverr Turnstile 等待超时(40轮仍未出 token)")
+            else:
+                logger.warning("FlareSolverr 未能提取到 Turnstile token(title=%s)", title[:80])
+            return None
 
         except httpx.TimeoutException:
             logger.warning("FlareSolverr Turnstile 求解超时(>%ds)", self.timeout)
@@ -118,6 +198,15 @@ class FlareSolverrClient:
         except Exception as e:
             logger.warning("FlareSolverr Turnstile 求解异常: %s", e)
             return None
+        finally:
+            # 步骤 4:销毁 session
+            try:
+                await sess.post("/v1", json={
+                    "cmd": "sessions.destroy",
+                    "session": session_id,
+                })
+            except Exception:
+                pass
 
     async def request_get(self, url: str, return_solution: bool = False) -> Optional[dict]:
         """用 FlareSolverr 访问一个 URL,过 Cloudflare 后返回响应数据。
