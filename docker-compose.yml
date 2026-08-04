@@ -1,0 +1,94 @@
+# Perchance 生图代理 - Docker Compose
+# 用法:
+#   1. 把项目传到服务器
+#   2. docker compose up -d --build
+#   3. 访问 http://服务器IP:2464
+#
+# 架构:单容器(前端 dist + 后端 uvicorn + patchright 浏览器 + Xvfb)
+#       端口 2464 直连,SSL 由外部网关处理。
+
+services:
+  perchance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: perchance-img:latest
+    container_name: perchance
+    restart: unless-stopped
+
+    ports:
+      - "2464:2464"
+
+    depends_on:
+      # 可选:等 flaresolverr 起来(如果启用了下面的服务)
+      # - flaresolverr
+
+    environment:
+      # 有头模式(过 Cloudflare 必须;headless 实测 403)
+      HEADLESS: "false"
+      # Xvfb 显示器(entrypoint.sh 会起 Xvfb :99)
+      DISPLAY: ":99"
+      PYTHONUNBUFFERED: "1"
+      # 应用启动即预热浏览器(首次生图不延迟)
+      WARMUP_ON_STARTUP: "true"
+
+      # ===== 住宅代理(过 Cloudflare 的关键)=====
+      # 当前先留空跑通流程。若生图返回 502/verifyUser 失败,
+      # 在这里填住宅代理地址(IP 被判 bot 时必须):
+      #   HTTP_PROXY: "http://user:pass@proxy.host:port"
+      #   HTTPS_PROXY: "http://user:pass@proxy.host:port"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+
+      # ===== FlareSolverr 验证码求解(可选)=====
+      # 启用后,遇到 Turnstile 挑战时优先调用 FlareSolverr 求解,
+      # 失败再回退到浏览器内方案。配了下面的 flaresolverr 服务就填:
+      #   FLARESOLVERR_URL: "http://flaresolverr:8191"
+      FLARESOLVERR_URL: ""
+
+      # ===== 浏览器持久化 =====
+      # storage_state(cookies/localStorage)保存目录,挂载到 Docker volume,
+      # 重启容器后 cf_clearance 自动恢复,不用重新验证。
+      BROWSER_DATA_DIR: "/app/browser_data"
+      ENHANCED_FINGERPRINT: "true"
+
+    # /dev/shm 扩容:chromium 默认 64MB 共享内存不够会崩
+    # cap-add: 允许容器内 ptrace 等(patchright chromium 需要)
+    shm_size: "2g"
+
+    # 持久化浏览器数据(cookies 等),重启后自动恢复验证状态
+    volumes:
+      - perchance-browser-data:/app/browser_data
+
+    # 健康检查:浏览器就绪即视为健康(不强制 CF 验证通过,因为 IP 差时可能一直通不过)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:2464/api/health | grep -q '\"browser_ready\":true'"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ===== 可选:FlareSolverr 验证码求解服务 =====
+  # 启用方法:
+  #   1. 取消下面 flaresolverr 服务的注释
+  #   2. 把 perchance 服务的 FLARESOLVERR_URL 改为 "http://flaresolverr:8191"
+  #   3. 取消 perchance 的 depends_on 注释(可选)
+  #
+  # 内存占用:约 200-300MB
+  # 成功率:60-80%(视 IP 质量),数据中心 IP 建议配合住宅代理
+  #
+  # flaresolverr:
+  #   image: flaresolverr/flaresolverr:latest
+  #   container_name: flaresolverr
+  #   restart: unless-stopped
+  #   environment:
+  #     LOG_LEVEL: info
+  #     BROWSER_TIMEOUT: 60000
+  #   # 不需要对外暴露端口,内网通信即可
+  #   # ports:
+  #   #   - "8191:8191"
+  #   shm_size: "1g"
+
+# 持久化卷:浏览器 storage_state 存在这里,容器重建不丢失
+volumes:
+  perchance-browser-data:

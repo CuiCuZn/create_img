@@ -1,0 +1,19 @@
+# 临时文件 / 缓存
+__pycache__
+*.pyc
+*.pyo
+.venv
+node_modules
+dist
+.git
+.gitignore
+
+# 本地开发文件
+.env
+*.md
+!requirements.txt
+
+# Docker 配置文件本身(不需要 COPY 进镜像)
+Dockerfile
+docker-compose.yml
+.dockerignore
