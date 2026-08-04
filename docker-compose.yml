@@ -19,10 +19,6 @@ services:
     ports:
       - "2464:2464"
 
-    depends_on:
-      # 可选:等 flaresolverr 起来(如果启用了下面的服务)
-      # - flaresolverr
-
     environment:
       # 有头模式(过 Cloudflare 必须;headless 实测 403)
       HEADLESS: "false"
