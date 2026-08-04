@@ -29,12 +29,8 @@ services:
       WARMUP_ON_STARTUP: "true"
 
       # ===== 住宅代理(过 Cloudflare 的关键)=====
-      # 当前先留空跑通流程。若生图返回 502/verifyUser 失败,
-      # 在这里填住宅代理地址(IP 被判 bot 时必须):
-      #   HTTP_PROXY: "http://user:pass@proxy.host:port"
-      #   HTTPS_PROXY: "http://user:pass@proxy.host:port"
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
+      HTTP_PROXY: "http://ssqc2rrv13sf:7CvA6hvUmHAVKXwZ@190.11.82.60:6010"
+      HTTPS_PROXY: "http://ssqc2rrv13sf:7CvA6hvUmHAVKXwZ@190.11.82.60:6010"
 
       # ===== FlareSolverr 验证码求解 =====
       # 已默认启用,配合下方 flaresolverr 服务一起启动。
@@ -73,6 +69,9 @@ services:
     environment:
       LOG_LEVEL: info
       BROWSER_TIMEOUT: 60000
+      # FlareSolverr 也走住宅代理,与 perchance 共用同一 IP
+      HOST_HTTP_PROXY: "http://ssqc2rrv13sf:7CvA6hvUmHAVKXwZ@190.11.82.60:6010"
+      HOST_HTTPS_PROXY: "http://ssqc2rrv13sf:7CvA6hvUmHAVKXwZ@190.11.82.60:6010"
     # 不需要对外暴露端口,内网通信即可
     # ports:
     #   - "8191:8191"
