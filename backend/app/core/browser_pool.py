@@ -37,13 +37,33 @@ def _resolve_proxy() -> Optional[dict]:
 
     优先 HTTPS_PROXY(生图走 https),其次 HTTP_PROXY。
     留空则返回 None(直连)。格式:http://user:pass@host:port
+
+    patchright 的 proxy 参数需要显式的 username/password 字段,
+    不能只放在 URL 里(虽然 Chromium 支持 URL 内联认证,但有时解析不稳定)。
     """
     proxy_url = (os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
                  or os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or "").strip()
     if not proxy_url:
         return None
-    logger.info("使用代理: %s", proxy_url)
-    return {"server": proxy_url}
+
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        logger.warning("代理地址格式异常,忽略: %s", proxy_url)
+        return None
+
+    proxy: dict[str, Any] = {
+        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+    }
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+
+    logger.info("使用代理: %s://%s:***@%s:%s",
+                parsed.scheme, parsed.username or "(无认证)",
+                parsed.hostname, parsed.port)
+    return proxy
 
 
 # 反检测初始化脚本:在每个页面的所有脚本之前执行(add_init_script 等价于
