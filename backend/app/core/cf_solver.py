@@ -40,11 +40,16 @@ class FlareSolverrClient:
         return bool(self.base_url)
 
     async def _get_session(self) -> httpx.AsyncClient:
-        """懒创建 httpx 客户端。"""
+        """懒创建 httpx 客户端。
+
+        注意:必须设置 trust_env=False,否则 httpx 会读取 HTTP_PROXY 环境变量,
+        导致连 flaresolverr:8191(内网地址)也走代理出去,连接失败。
+        """
         if self._session is None or self._session.is_closed:
             self._session = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.timeout,
+                trust_env=False,  # 关键:不读取系统代理环境变量
             )
         return self._session
 
